@@ -13,6 +13,10 @@ on:
         description: "Test only. Simulate this time (ISO, e.g. 2026-10-04T12:28:00-04:00) as a dry run, no email or state."
         required: false
         default: ""
+      check_login:
+        description: "Test only. Sign in to Gmail with the saved secrets, send nothing."
+        type: boolean
+        default: false
 
 permissions:
   contents: write   # commit the evaluated-games state file
@@ -44,7 +48,9 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
-          if [ -n "$TEST_NOW" ]; then
+          if [ "${{ inputs.check_login }}" = "true" ]; then
+            python -c "import os, smtplib; s = smtplib.SMTP_SSL('smtp.gmail.com', 465); s.login(os.environ['SMTP_USER'], os.environ['SMTP_PASS']); print('Gmail login OK, recipient set:', bool(os.environ.get('RECIPIENT')))"
+          elif [ -n "$TEST_NOW" ]; then
             python nfl_fade_alert.py --dry-run --now "$TEST_NOW"
           else
             python nfl_fade_alert.py --loop
