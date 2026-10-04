@@ -1,9 +1,12 @@
 name: NFL fade alert
 
-# Triggered every 5 minutes during game windows by cron-job.org via the
-# workflow_dispatch API. GitHub's own `schedule` trigger drifts by hours, too
-# late for a 30-minutes-before-kickoff alert, so it is not used here.
+# GitHub starts this every 4 hours (its scheduler can run hours late, so the
+# frequent starts are just a safety net). On game days the run stays up and
+# checks ~30 min before each kickoff. Runs are capped at 6h, so before that the
+# script starts a fresh run of itself. On days with no games it exits in seconds.
 on:
+  schedule:
+    - cron: "7 */4 * * *"
   workflow_dispatch:
     inputs:
       test_now:
@@ -12,8 +15,10 @@ on:
         default: ""
 
 permissions:
-  contents: write   # to commit the evaluated-games state file
+  contents: write   # commit the evaluated-games state file
+  actions: write    # start the next run
 
+# One watcher at a time. A new start waits for the current one to finish.
 concurrency:
   group: nfl-fade-alert
   cancel-in-progress: false
@@ -21,7 +26,7 @@ concurrency:
 jobs:
   alert:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -29,26 +34,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run alert
+      - name: Watch for kickoffs
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           RECIPIENT: ${{ secrets.RECIPIENT }}
+          GH_TOKEN: ${{ github.token }}
           TEST_NOW: ${{ inputs.test_now }}
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
           if [ -n "$TEST_NOW" ]; then
             python nfl_fade_alert.py --dry-run --now "$TEST_NOW"
           else
-            python nfl_fade_alert.py
-          fi
-
-      # Each game is evaluated once. Persist which ones so the next run skips them.
-      - name: Save state
-        run: |
-          if [ -f nfl_fade_alert_state.json ] && [ -n "$(git status --porcelain nfl_fade_alert_state.json)" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
-            git add nfl_fade_alert_state.json
-            git commit -m "Update evaluated games"
-            git push
+            python nfl_fade_alert.py --loop
           fi

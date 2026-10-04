@@ -18,12 +18,14 @@
 #   RECIPIENT             defaults to SMTP_USER
 #
 # Usage:
-#   python3 nfl_fade_alert.py                 normal run
+#   python3 nfl_fade_alert.py                 one check, then exit
+#   python3 nfl_fade_alert.py --loop          stay up, checking ~30 min before each
+#                                             kickoff (GitHub Actions mode, see below)
 #   python3 nfl_fade_alert.py --dry-run       print instead of email, no state writes
 #   python3 nfl_fade_alert.py --dry-run --now 2026-10-04T12:30:00-04:00
 #                                             simulate a different current time
 
-import os, re, sys, json, html, smtplib, argparse, datetime, traceback
+import os, re, sys, json, html, time, smtplib, argparse, datetime, traceback, subprocess
 import urllib.request
 from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
@@ -31,6 +33,15 @@ from zoneinfo import ZoneInfo
 SPLIT_SUM_MAX    = 50
 LOOKBACK_HOURS   = 48
 ALERT_WINDOW_MIN = 35   # 5-min cadence -> first check lands ~30-35 min out
+
+# --loop mode. GitHub Actions jobs die at 6h, so a run works for at most
+# RUN_BUDGET_MIN, then starts a fresh run of itself if a check is due within
+# CHAIN_HOURS. Further out than that, it exits and waits for the next scheduled
+# trigger (every 4h).
+CHECK_LEAD_MIN = 32
+RUN_BUDGET_MIN = 330
+CHAIN_HOURS    = 12
+MAX_SLEEP_MIN  = 15
 
 SBD_URL = ("https://www.sportsbettingdime.com/wp-json/adpt/v1/nfl-odds"
            "?books=sr%3Abook%3A17324%2Csr%3Abook%3A18149%2Csr%3Abook%3A18186&format=us")
@@ -247,25 +258,18 @@ def save_state(state, now_utc):
 
 
 # ── main ────────────────────────────────────────────────────────────────────
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--now", help="ISO datetime with offset, to simulate")
-    args = ap.parse_args()
-
-    now_utc = (datetime.datetime.fromisoformat(args.now).astimezone(datetime.timezone.utc)
-               if args.now else datetime.datetime.now(datetime.timezone.utc))
+def check_once(now_utc, state, dry_run, games=None):
+    """Evaluate every game kicking off within ALERT_WINDOW_MIN. Mutates state.
+    Returns True if any game was evaluated."""
     now_et = now_utc.astimezone(ET)
-    state = {} if args.dry_run else load_state()
-
-    games = sbd_games()
+    games = games if games is not None else sbd_games()
     due = [g for g in games
            if g["id"] not in state
            and g["status"] == "not_started"
            and datetime.timedelta(0) < g["kickoff"] - now_utc <= datetime.timedelta(minutes=ALERT_WINDOW_MIN)]
     if not due:
-        print(f"{now_et:%Y-%m-%d %H:%M} ET: nothing kicking off within {ALERT_WINDOW_MIN} min")
-        return
+        print(f"{now_et:%Y-%m-%d %H:%M} ET: nothing kicking off within {ALERT_WINDOW_MIN} min", flush=True)
+        return False
 
     # One email per kickoff slot.
     slots = {}
@@ -288,19 +292,93 @@ def main():
         except Exception:
             # A failed check should not look like "no matches". Say so once per slot.
             err = traceback.format_exc()
-            print(err, file=sys.stderr)
+            print(err, file=sys.stderr, flush=True)
             send(f"NFL fade alert could not run ({fmt_kick(kickoff)})",
                  f"The check for games kicking off {fmt_kick(kickoff)} failed, so matches may have been missed.\n\n{err}",
-                 args.dry_run)
+                 dry_run)
         else:
             print(f"{now_et:%Y-%m-%d %H:%M} ET: slot {fmt_kick(kickoff)}, "
-                  f"{len(slot_games)} games, {len(quals)} qualifiers")
+                  f"{len(slot_games)} games, {len(quals)} qualifiers", flush=True)
             if quals:
-                send(*build_email(kickoff, quals, notes), args.dry_run)
+                send(*build_email(kickoff, quals, notes), dry_run)
         for g in slot_games:
             state[g["id"]] = now_utc.isoformat()
+    return True
 
-    if not args.dry_run:
+
+def next_check_time(games, state, now_utc):
+    """When the next unevaluated game enters the alert window."""
+    times = [g["kickoff"] - datetime.timedelta(minutes=CHECK_LEAD_MIN)
+             for g in games
+             if g["id"] not in state and g["status"] == "not_started" and g["kickoff"] > now_utc]
+    return min(times) if times else None
+
+
+def commit_state():
+    """Persist state to the repo so later runs skip evaluated games."""
+    if not os.environ.get("GITHUB_ACTIONS"):
+        return
+    if not subprocess.run(["git", "status", "--porcelain", STATE_FILE],
+                          capture_output=True, text=True).stdout.strip():
+        return
+    for cmd in (["git", "add", STATE_FILE],
+                ["git", "commit", "-q", "-m", "Update evaluated games"],
+                ["git", "pull", "-q", "--rebase"],
+                ["git", "push", "-q"]):
+        subprocess.run(cmd, check=True)
+
+
+def start_next_run():
+    """Kick off a fresh workflow run (it queues behind this one)."""
+    subprocess.run(["gh", "workflow", "run", "alert.yml", "--ref", "main"], check=True)
+    print("Started the next run to keep watching.", flush=True)
+
+
+def loop(dry_run):
+    started = datetime.datetime.now(datetime.timezone.utc)
+    deadline = started + datetime.timedelta(minutes=RUN_BUDGET_MIN)
+    state = load_state()
+    while True:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        try:
+            games = sbd_games()
+            if check_once(now, state, dry_run, games):
+                save_state(state, now)
+                commit_state()
+            nxt = next_check_time(games, state, now)
+        except Exception:
+            # Network blip etc. Retry shortly rather than end the watch.
+            traceback.print_exc()
+            nxt = now + datetime.timedelta(minutes=5)
+
+        if nxt is None or nxt - now > datetime.timedelta(hours=CHAIN_HOURS):
+            print(f"No check due in the next {CHAIN_HOURS}h. Exiting until the next scheduled start.", flush=True)
+            return
+        if nxt > deadline:
+            if not dry_run:
+                start_next_run()
+            return
+        wake = min(max(nxt, now + datetime.timedelta(seconds=30)),
+                   now + datetime.timedelta(minutes=MAX_SLEEP_MIN))
+        print(f"Next check {nxt.astimezone(ET):%a %H:%M} ET. Sleeping until {wake.astimezone(ET):%H:%M} ET.", flush=True)
+        time.sleep((wake - now).total_seconds())
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--loop", action="store_true")
+    ap.add_argument("--now", help="ISO datetime with offset, to simulate (single check only)")
+    args = ap.parse_args()
+
+    if args.loop:
+        loop(args.dry_run)
+        return
+
+    now_utc = (datetime.datetime.fromisoformat(args.now).astimezone(datetime.timezone.utc)
+               if args.now else datetime.datetime.now(datetime.timezone.utc))
+    state = {} if args.dry_run else load_state()
+    if check_once(now_utc, state, args.dry_run) and not args.dry_run:
         save_state(state, now_utc)
 
 
