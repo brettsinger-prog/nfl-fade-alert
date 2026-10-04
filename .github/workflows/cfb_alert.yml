@@ -1,0 +1,57 @@
+name: CFB fade alert
+
+# GitHub starts this every 4 hours (its scheduler can run hours late, so the
+# frequent starts are just a safety net). On game days the run stays up and
+# checks ~30 min before each kickoff. Runs are capped at 6h, so before that the
+# script starts a fresh run of itself. On days with no games it exits in seconds.
+on:
+  schedule:
+    - cron: "37 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      test_now:
+        description: "Test only. Simulate this time (ISO, e.g. 2026-10-10T15:00:00-04:00) as a dry run, no email or state."
+        required: false
+        default: ""
+      check_login:
+        description: "Test only. Sign in to Gmail with the saved secrets, send nothing."
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # commit the evaluated-games state file
+  actions: write    # start the next run
+
+# One watcher at a time. A new start waits for the current one to finish.
+concurrency:
+  group: cfb-fade-alert
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Watch for kickoffs
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          RECIPIENT: ${{ secrets.RECIPIENT }}
+          GH_TOKEN: ${{ github.token }}
+          TEST_NOW: ${{ inputs.test_now }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          if [ "${{ inputs.check_login }}" = "true" ]; then
+            python -c "import os, smtplib; s = smtplib.SMTP_SSL('smtp.gmail.com', 465); s.login(os.environ['SMTP_USER'], os.environ['SMTP_PASS']); print('Gmail login OK, recipient set:', bool(os.environ.get('RECIPIENT')))"
+          elif [ -n "$TEST_NOW" ]; then
+            python cfb_fade_alert.py --dry-run --now "$TEST_NOW"
+          else
+            python cfb_fade_alert.py --loop
+          fi
