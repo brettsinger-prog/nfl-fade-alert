@@ -5,6 +5,11 @@ name: NFL fade alert
 # late for a 30-minutes-before-kickoff alert, so it is not used here.
 on:
   workflow_dispatch:
+    inputs:
+      test_now:
+        description: "Test only. Simulate this time (ISO, e.g. 2026-10-04T12:28:00-04:00) as a dry run, no email or state."
+        required: false
+        default: ""
 
 permissions:
   contents: write   # to commit the evaluated-games state file
@@ -29,7 +34,13 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           RECIPIENT: ${{ secrets.RECIPIENT }}
-        run: python nfl_fade_alert.py
+          TEST_NOW: ${{ inputs.test_now }}
+        run: |
+          if [ -n "$TEST_NOW" ]; then
+            python nfl_fade_alert.py --dry-run --now "$TEST_NOW"
+          else
+            python nfl_fade_alert.py
+          fi
 
       # Each game is evaluated once. Persist which ones so the next run skips them.
       - name: Save state
