@@ -1,0 +1,43 @@
+name: NFL fade alert
+
+# Triggered every 5 minutes during game windows by cron-job.org via the
+# workflow_dispatch API. GitHub's own `schedule` trigger drifts by hours, too
+# late for a 30-minutes-before-kickoff alert, so it is not used here.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # to commit the evaluated-games state file
+
+concurrency:
+  group: nfl-fade-alert
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run alert
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          RECIPIENT: ${{ secrets.RECIPIENT }}
+        run: python nfl_fade_alert.py
+
+      # Each game is evaluated once. Persist which ones so the next run skips them.
+      - name: Save state
+        run: |
+          if [ -f nfl_fade_alert_state.json ] && [ -n "$(git status --porcelain nfl_fade_alert_state.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+            git add nfl_fade_alert_state.json
+            git commit -m "Update evaluated games"
+            git push
+          fi
