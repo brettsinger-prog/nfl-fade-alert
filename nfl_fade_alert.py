@@ -355,12 +355,16 @@ def loop(dry_run):
         if nxt is None or nxt - now > datetime.timedelta(hours=CHAIN_HOURS):
             print(f"No check due in the next {CHAIN_HOURS}h. Exiting until the next scheduled start.", flush=True)
             return
-        if nxt > deadline:
+        # Hand off to a fresh run only once this one is nearly out of time.
+        # Handing off as soon as the next check lies past the deadline made
+        # each new run hand off again within seconds (hundreds of runs).
+        if nxt > deadline and deadline - now <= datetime.timedelta(minutes=1):
             if not dry_run:
                 start_next_run()
             return
         wake = min(max(nxt, now + datetime.timedelta(seconds=30)),
-                   now + datetime.timedelta(minutes=MAX_SLEEP_MIN))
+                   now + datetime.timedelta(minutes=MAX_SLEEP_MIN),
+                   max(deadline - datetime.timedelta(seconds=30), now + datetime.timedelta(seconds=5)))
         print(f"Next check {nxt.astimezone(ET):%a %H:%M} ET. Sleeping until {wake.astimezone(ET):%H:%M} ET.", flush=True)
         time.sleep((wake - now).total_seconds())
 
