@@ -402,11 +402,23 @@ def commit_state():
     if not subprocess.run(["git", "status", "--porcelain", STATE_FILE],
                           capture_output=True, text=True).stdout.strip():
         return
-    for cmd in (["git", "add", STATE_FILE],
-                ["git", "commit", "-q", "-m", "Update evaluated CFB games"],
-                ["git", "pull", "-q", "--rebase"],
-                ["git", "push", "-q"]):
-        subprocess.run(cmd, check=True)
+    subprocess.run(["git", "add", STATE_FILE], check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "Update evaluated CFB games"], check=True)
+    if subprocess.run(["git", "pull", "-q", "--rebase"]).returncode != 0:
+        # Another run changed the state file too. Keep both sets of games.
+        subprocess.run(["git", "rebase", "--abort"])
+        with open(STATE_FILE) as f:
+            mine = json.load(f)
+        subprocess.run(["git", "fetch", "-q"], check=True)
+        theirs = json.loads(subprocess.run(
+            ["git", "show", f"origin/main:{os.path.basename(STATE_FILE)}"],
+            capture_output=True, text=True, check=True).stdout or "{}")
+        subprocess.run(["git", "reset", "-q", "--hard", "origin/main"], check=True)
+        with open(STATE_FILE, "w") as f:
+            json.dump({**theirs, **mine}, f, indent=1)
+        subprocess.run(["git", "add", STATE_FILE], check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "Update evaluated CFB games"], check=True)
+    subprocess.run(["git", "push", "-q"], check=True)
 
 
 def start_next_run():
@@ -418,6 +430,10 @@ def start_next_run():
 def loop(dry_run):
     started = datetime.datetime.now(datetime.timezone.utc)
     deadline = started + datetime.timedelta(minutes=RUN_BUDGET_MIN)
+    # A run that sat queued behind another has a stale checkout. Pick up the
+    # games the earlier run already evaluated so they are not checked twice.
+    if os.environ.get("GITHUB_ACTIONS"):
+        subprocess.run(["git", "pull", "-q", "--rebase"])
     state = load_state()
     while True:
         now = datetime.datetime.now(datetime.timezone.utc)
