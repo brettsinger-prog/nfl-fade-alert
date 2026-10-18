@@ -32,7 +32,7 @@ import urllib.request
 from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
 
-SPLIT_SUM_MAX    = 50
+SPLIT_SUM_MAX    = 60
 LOOKBACK_HOURS   = 48
 ALERT_WINDOW_MIN = 35
 TOP_N            = 25
